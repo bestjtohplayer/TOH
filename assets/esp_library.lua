@@ -1,179 +1,212 @@
--- !nocheck --
+local Library = {}
+getgenv().ESPLibrary = Library
+
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
-local Camera = workspace.CurrentCamera
+local CoreGui = game:GetService("CoreGui")
+
+local Camera = Workspace.CurrentCamera
 local LocalPlayer = Players.LocalPlayer
 
-ESP = ESP or {
-    Enabled = true,
-    ShowBoxes = true,
-    ShowNames = true,
-    ShowTracers = true,
-    ShowHealth = true,
-    Color = nil,
-    HealthColorMode = "match",
-    HealthColorFunction = function(healthPercent)
-        if healthPercent > 0.7 then
-            return Color3.fromRGB(0, 255, 0)
-        elseif healthPercent > 0.3 then
-            return Color3.fromRGB(255, 165, 0)
-        else
-            return Color3.fromRGB(255, 0, 0)
-        end
-    end
+local Cache = {}
+local Connection = nil
+
+local Vector2New = Vector2.new
+local Vector3New = Vector3.new
+local Color3New = Color3.new
+local DrawingNew = Drawing and Drawing.new
+local WorldToViewportPoint = Camera.WorldToViewportPoint
+local Round = math.round
+
+local Settings = {
+    Tracers = false,
+    Distance = false,
+    MaxDistance = 5000,
+    TextSize = 23,
+    Font = Enum.Font.GothamBold
 }
 
-local ESPObjects = {}
-
-local function newDrawing(type, props)
-    local obj = Drawing.new(type)
-    for k, v in pairs(props) do
-        obj[k] = v
+local function GetRoot(model)
+    if model:IsA("BasePart") then return model end
+    if model:IsA("Model") then 
+        return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart") 
     end
-    return obj
+    return nil
 end
 
-local function createESPElements()
+local function CreateVisuals(part, color, name)
+    local root = GetRoot(part)
+    if not root then return nil end
+    
+    if root:IsDescendantOf(LocalPlayer.Character) or part:IsDescendantOf(LocalPlayer.Character) then 
+        return nil 
+    end
+
+    local highlight = Instance.new("Highlight")
+    highlight.FillColor = color
+    highlight.OutlineColor = Color3New(1, 1, 1)
+    highlight.FillTransparency = 0.5
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Adornee = part
+    highlight.Enabled = false
+    highlight.Parent = part
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Size = UDim2.new(0, 200, 0, 50)
+    billboard.StudsOffset = Vector3New(0, 3, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Enabled = false
+    billboard.Adornee = root
+    billboard.Parent = part
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.TextColor3 = color
+    label.Font = Settings.Font
+    label.TextSize = Settings.TextSize
+    label.Text = name
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = Color3New(0, 0, 0)
+    label.Parent = billboard
+
+    local tracer = nil
+    if DrawingNew then
+        tracer = DrawingNew("Line")
+        tracer.Visible = false
+        tracer.Color = color
+        tracer.Thickness = 1
+        tracer.Transparency = 1
+    end
+
     return {
-        Box = newDrawing("Square", {Visible = false, Thickness = 2, Filled = false, Color = Color3.new(1,1,1)}),
-        Name = newDrawing("Text", {Visible = false, Center = true, Outline = true, Size = 16, Font = 2, Color = Color3.new(1,1,1)}),
-        Tracer = newDrawing("Line", {Visible = false, Thickness = 1, Color = Color3.new(1,1,1)}),
-        HealthBar = newDrawing("Line", {Visible = false, Thickness = 4, Color = Color3.new(0,1,0)})
+        Root = root,
+        Highlight = highlight,
+        Gui = billboard,
+        Label = label,
+        Tracer = tracer,
+        Name = name,
+        LastDist = -1
     }
 end
 
-local function getRainbowColor(t)
-    local freq = 2
-    return Color3.new(
-        math.sin(freq * t) * 0.5 + 0.5,
-        math.sin(freq * t + 2) * 0.5 + 0.5,
-        math.sin(freq * t + 4) * 0.5 + 0.5
-    )
+function Library:SetTracers(bool) 
+    Settings.Tracers = bool 
 end
 
-local function getBoxScreenPoints(cframe, size)
-    local half = size / 2
-    local points = {}
-    local visible = true
-    for x = -1,1,2 do
-        for y = -1,1,2 do
-            for z = -1,1,2 do
-                local corner = cframe * Vector3.new(half.X*x, half.Y*y, half.Z*z)
-                local screenPos, onScreen = Camera:WorldToViewportPoint(corner)
-                if not onScreen then visible = false end
-                table.insert(points, Vector2.new(screenPos.X, screenPos.Y))
-            end
+function Library:ShowDistance(bool) 
+    Settings.Distance = bool 
+end
+
+function Library:SetMaxDistance(num) 
+    Settings.MaxDistance = num 
+end
+
+function Library:RemoveESP(part)
+    local data = Cache[part]
+    if data then
+        if data.Highlight then data.Highlight:Destroy() end
+        if data.Gui then data.Gui:Destroy() end
+        if data.Tracer then 
+            data.Tracer.Visible = false
+            data.Tracer:Remove() 
         end
+        Cache[part] = nil
     end
-    return points, visible
 end
 
-local function hideAll(data)
-    data.Box.Visible = false
-    data.Name.Visible = false
-    data.Tracer.Visible = false
-    data.HealthBar.Visible = false
-end
+function Library:AddESP(part, name, color)
+    if not part or Cache[part] then return end
+    
+    local data = CreateVisuals(part, color, name)
+    if not data then return end
 
-RunService.RenderStepped:Connect(function()
-    if not ESP.Enabled then
-        for _, data in pairs(ESPObjects) do
-            hideAll(data)
+    local connection
+    connection = part.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            connection:Disconnect()
+            Library:RemoveESP(part)
         end
-        return
+    end)
+
+    Cache[part] = data
+end
+
+function Library:Unload()
+    if Connection then Connection:Disconnect() end
+    for part in pairs(Cache) do 
+        Library:RemoveESP(part) 
     end
+    table.clear(Cache)
+    getgenv().ESPLibrary = nil
+end
 
-    local now = tick()
-    local baseColor = ESP.Color or getRainbowColor(now)
-    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+local function Update()
+    if not LocalPlayer.Character then return end
+    
+    Camera = Workspace.CurrentCamera
+    local viewportSize = Camera.ViewportSize
+    local centerPos = Vector2New(viewportSize.X / 2, viewportSize.Y)
+    local currentFOV = Camera.FieldOfView
+    
+    for _, data in pairs(Cache) do
+        local rootPart = data.Root
+        
+        if not rootPart or not rootPart.Parent then
+            data.Gui.Enabled = false
+            data.Highlight.Enabled = false
+            if data.Tracer then data.Tracer.Visible = false end
+            continue
+        end
 
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local character = player.Character
-            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-            if character and humanoid and humanoid.Health > 0 then
-                local success, cframe, size = pcall(character.GetBoundingBox, character)
-                if success and cframe and size then
-                    local points, visible = getBoxScreenPoints(cframe, size)
-                    if not visible then
-                        if ESPObjects[player] then
-                            hideAll(ESPObjects[player])
-                        end
-                    else
-                        local data = ESPObjects[player] or createESPElements()
-                        ESPObjects[player] = data
+        local rootPosition = rootPart.Position
+        local vector, onScreen = Camera:WorldToViewportPoint(rootPosition)
+        local distance = (Camera.CFrame.Position - rootPosition).Magnitude
 
-                        local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
-                        for _, pt in ipairs(points) do
-                            minX = math.min(minX, pt.X)
-                            minY = math.min(minY, pt.Y)
-                            maxX = math.max(maxX, pt.X)
-                            maxY = math.max(maxY, pt.Y)
-                        end
+        if distance > Settings.MaxDistance then
+            data.Gui.Enabled = false
+            data.Highlight.Enabled = false
+            if data.Tracer then data.Tracer.Visible = false end
+            continue
+        end
 
-                        local boxWidth, boxHeight = maxX - minX, maxY - minY
-                        local slimWidth = boxWidth * 0.7
-                        local slimX = minX + (boxWidth - slimWidth) / 2
-                        local healthRatio = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+        if onScreen then
+            data.Gui.Enabled = true
+            data.Highlight.Enabled = true
+            
+            data.Label.TextSize = Settings.TextSize * (currentFOV / 70)
 
-                        if ESP.ShowBoxes then
-                            data.Box.Visible = true
-                            data.Box.Position = Vector2.new(slimX, minY)
-                            data.Box.Size = Vector2.new(slimWidth, boxHeight)
-                            data.Box.Color = baseColor
-                        else
-                            data.Box.Visible = false
-                        end
-
-                        if ESP.ShowNames then
-                            data.Name.Visible = true
-                            data.Name.Text = player.Name
-                            data.Name.Position = Vector2.new(slimX + slimWidth/2, minY - 20)
-                            data.Name.Color = baseColor
-                        else
-                            data.Name.Visible = false
-                        end
-
-                        if ESP.ShowTracers then
-                            data.Tracer.Visible = true
-                            data.Tracer.From = screenCenter
-                            data.Tracer.To = Vector2.new(slimX + slimWidth/2, maxY)
-                            data.Tracer.Color = baseColor
-                        else
-                            data.Tracer.Visible = false
-                        end
-
-                        if ESP.ShowHealth then
-                            local barHeight = boxHeight * healthRatio
-                            data.HealthBar.Visible = true
-
-                            if ESP.HealthColorMode == "custom" and ESP.HealthColorFunction then
-                                data.HealthBar.Color = ESP.HealthColorFunction(healthRatio)
-                            else
-                                data.HealthBar.Color = baseColor
-                            end
-
-                            data.HealthBar.From = Vector2.new(slimX - 6, maxY)
-                            data.HealthBar.To = Vector2.new(slimX - 6, maxY - barHeight)
-                        else
-                            data.HealthBar.Visible = false
-                        end
-                    end
+            if Settings.Distance then
+                local distMath = Round(distance)
+                if data.LastDist ~= distMath then
+                    data.LastDist = distMath
+                    data.Label.Text = string.format("%s\n[%d]", data.Name, distMath)
                 end
             else
-                if ESPObjects[player] then
-                    hideAll(ESPObjects[player])
+                if data.Label.Text ~= data.Name then
+                    data.Label.Text = data.Name
                 end
             end
-        end
-    end
-end)
 
-Players.PlayerRemoving:Connect(function(player)
-    if ESPObjects[player] then
-        for _, obj in pairs(ESPObjects[player]) do
-            obj:Remove()
+            if data.Tracer then
+                if Settings.Tracers then
+                    data.Tracer.From = centerPos
+                    data.Tracer.To = Vector2New(vector.X, vector.Y)
+                    data.Tracer.Visible = true
+                else
+                    data.Tracer.Visible = false
+                end
+            end
+        else
+            data.Gui.Enabled = false
+            data.Highlight.Enabled = false
+            if data.Tracer then data.Tracer.Visible = false end
         end
-        ESPObjects[player] = nil
     end
-end)
+end
+
+Connection = RunService.RenderStepped:Connect(Update)
+
+return Library
